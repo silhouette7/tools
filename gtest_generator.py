@@ -1,3 +1,12 @@
+'''
+    Create gtest unittest file according to header file
+    Known issues:
+    1. If there is a function implementation in the header file, this script may treat the "};" at the end of function as the end of a class in mistake
+    2. Cannot construct class that has not public constructer correctly, e.g. singlton
+    3. Cannot analysis default parameter ('=' in the args list)
+    4. fail to analysis nested namespace
+'''
+
 import sys
 import getopt
 import os
@@ -29,7 +38,7 @@ TEST_SUITE_TEMPLATE = (
     "    static void TearDownTestCase()\n"
     "    {\n"
     "    }\n"
-    "};\n\n"
+    "};\n"
 )
 
 TEST_FUNC_TEMPLATE = (
@@ -69,14 +78,24 @@ class GtestGenerator:
         self.cur_parse_state = 0
         self.cur_func_name = None
         self.cur_func_args = None
+        self.include = ""
+        self.namespace = ""
+        self.test_suite = ""
+        self.test_case = ""
 
     def initializeGtestFile(self):
         for file_name in COMMON_INCLUDE_FILES:
-            self.output_file.write("#include <" + file_name + ">\n")
+            self.include += ("#include <" + file_name + ">\n")
 
-        self.output_file.write("#include \"" + self.input_file_name.rpartition("/")[2].rpartition("\\")[2] + "\"\n\n")
-        self.output_file.write("using namespace ::testing;\n\n")
-        self.output_file.write(TEST_SUITE_TEMPLATE.replace("Template", self.test_suite_name))        
+        self.include += ("#include \"" + self.input_file_name.rpartition("/")[2].rpartition("\\")[2] + "\"\n")
+        self.namespace += "using namespace ::testing;\n"
+        self.test_suite += TEST_SUITE_TEMPLATE.replace("Template", self.test_suite_name)
+
+    def finalizeGtestFile(self):
+        self.output_file.write(self.include + "\n")
+        self.output_file.write(self.namespace + "\n")
+        self.output_file.write(self.test_suite + "\n")
+        self.output_file.write(self.test_case)
 
     def checkAccessControl(self):
         return self.access_control != True or (not self.cur_parse_state & ParseState.CLASS.value) or self.cur_access_state == ClassAccessControl.PUBLIC
@@ -105,11 +124,11 @@ class GtestGenerator:
         args_str = ""
         args = func_args_str.split(",")
         for arg in args:
-            argv = re.search(r"([^ \f\n\r\t\v\*&]+)\s*([\*&]*)\s*\w*$", arg.strip())
+            argv = re.search(r"(const\s*)*([^\*&]+)([\s\*&\)]+)\S*$", arg.strip())
             if argv is None:
                 continue
-            arg_type = argv.group(1)
-            pointer_or_ref = argv.group(2)
+            arg_type = argv.group(2).strip()
+            pointer_or_ref = argv.group(3).strip()
             if arg_type == "void" and (pointer_or_ref is None or pointer_or_ref == ""):
                 continue
             if pointer_or_ref is not None and pointer_or_ref == "*":
@@ -140,7 +159,7 @@ class GtestGenerator:
                 result = result.replace("Template_construct", self.class_consturct_str).replace("Template_Test", PRE_LINE_PENDING + "testInstance.{}({});\n".format(self.cur_func_name, args_str))
             else:
                 result = result.replace("Template_construct", "").replace("Template_Test", PRE_LINE_PENDING + "{}({});\n".format(self.cur_func_name, args_str))
-            self.output_file.write(result)
+            self.test_case += result
             i += 1
 
         self.cur_func_name = None
@@ -155,10 +174,14 @@ class GtestGenerator:
 
                 lines = self.input_file.readlines()
                 for line in lines:
+                    #annotation
+                    if line.strip().startswith("//"):
+                        continue
+
                     #parse namespace
                     namespace_line = re.search(r"\s*namespace\s+([\S]+)$", line)
                     if namespace_line is not None:
-                        self.output_file.write("using namespace " + namespace_line.group(1) + ";\n")
+                        self.namespace += ("using namespace " + namespace_line.group(1) + ";\n")
                         continue
 
                     #parse class name
@@ -171,18 +194,18 @@ class GtestGenerator:
 
                     #parse constructer (only call the first constructer if there are more than one)
                     if self.cur_parse_state & ParseState.CLASS.value:
-                        constructer_line = re.search(r"\s*[^~]" + self.class_name + r"\s*\(([^\)]*)([\);]*)", line)
+                        constructer_line = re.search(r"\s*[^~]" + self.class_name + r"\s*\(([^\)]*)(\)\s*;)*", line)
                         if constructer_line is not None:
                             self.cur_parse_state |= ParseState.CONSTRUCTER.value
                             self.class_construct_args = constructer_line.group(1)
                             constructer_end = constructer_line.group(2)
-                            if constructer_end != "":
+                            if constructer_end is not None:
                                 self.parseConstructer()
                             continue
 
                     #parse constructer args
                     if self.cur_parse_state & ParseState.CONSTRUCTER.value:
-                        args_line = re.search(r"([^\)]*)\s*([\);]*)", line)
+                        args_line = re.search(r"([^\)]*)\s*(\)\s*;)*", line)
                         if args_line is not None:
                             args = args_line.group(1).strip()
                             args_end = args_line.group(2)
@@ -192,14 +215,15 @@ class GtestGenerator:
                                 self.parseConstructer()
                             continue
 
+                    #TODO: treat "};" as the end of class in mistake, even if it just the end of a function implementation
                     #parse function
-                    function_line = re.search(r"[\w\s]*(\w[\w\s\*&]+)\s+(\w+)\s*\(([^\)]*)([\);]*)", line)
+                    function_line = re.search(r"[\w\s]*(\w[\w\s\*&]+)\s+(\w+)\s*\(([^\)]*)(\)\s*;)*", line)
                     if function_line is not None:
                         self.cur_parse_state |= ParseState.FUNCTION.value
                         self.cur_func_name = function_line.group(2)
                         self.cur_func_args = function_line.group(3)
                         function_end = function_line.group(4)
-                        if function_end != "":
+                        if function_end is not None:
                             if self.checkAccessControl() == True:
                                 self.parseFunction()
                             else:
@@ -212,7 +236,7 @@ class GtestGenerator:
 
                     #parse function args
                     if self.cur_parse_state & ParseState.FUNCTION.value:
-                        args_line = re.search(r"([^\)]*)\s*([\);]*)", line)
+                        args_line = re.search(r"([^\)]*)\s*(\)\s*;)*", line)
                         if args_line is not None:
                             args = args_line.group(1).strip()
                             args_end = args_line.group(2)
@@ -237,6 +261,8 @@ class GtestGenerator:
                     if (self.cur_parse_state & ParseState.CLASS.value) and "};" in line:
                         self.leaveClass()
                         continue
+
+                self.finalizeGtestFile()
 
 def checkHeadFile(input):
     if os.path.exists(input) == False:
